@@ -12,7 +12,8 @@
 //   - ExpressionPatternDotAll - Matches expressions with dotall mode (multiline)
 //
 // ## Context Access Patterns
-//   - NeedsStepsPattern - Matches needs.* and steps.* patterns
+//   - NeedsStepsPattern - Matches needs.* and steps.* patterns (anchored, validation)
+//   - NeedsJobReferencePattern - Extracts job names from needs.<job>. references (unanchored, extraction)
 //   - InputsPattern - Matches github.event.inputs.* patterns
 //   - WorkflowCallInputsPattern - Matches inputs.* patterns (workflow_call)
 //   - AWInputsPattern - Matches github.aw.inputs.* patterns
@@ -108,7 +109,25 @@ var (
 var (
 	// NeedsStepsPattern matches needs.* and steps.* context patterns
 	// Example: needs.build.outputs.version, steps.setup.outputs.path
+	// Anchored — validates that an entire input string is a well-formed needs/steps expression body.
 	NeedsStepsPattern = regexp.MustCompile(`^(needs|steps)\.[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+)*$`)
+
+	// NeedsJobReferencePattern extracts the job name from a `needs.<jobName>.` reference
+	// embedded in arbitrary content (markdown, env values, custom steps).
+	//
+	// Unlike NeedsStepsPattern (which is anchored and used for whole-expression validation),
+	// this pattern is unanchored for use with FindAllStringSubmatch to discover every
+	// referenced job within a larger string.
+	//
+	// The leading `\b` (word boundary) prevents prefix collisions like `myneeds.foo.bar`
+	// from spuriously matching as `needs.foo.`.
+	//
+	// IMPORTANT: This pattern matches text *anywhere* in its input — including inside
+	// prose, comments, or string literals.  Callers that only want references appearing
+	// inside real `${{ ... }}` expressions should first extract expression bodies via
+	// `ExpressionPatternDotAll` and then apply this pattern to each body (see
+	// `findNeedsJobRefs` in `compiler_main_job.go`).
+	NeedsJobReferencePattern = regexp.MustCompile(`\bneeds\.([A-Za-z_][A-Za-z0-9_-]*)\.`)
 
 	// InputsPattern matches github.event.inputs.* patterns
 	// Example: github.event.inputs.workflow_id

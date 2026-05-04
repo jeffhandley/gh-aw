@@ -24,7 +24,6 @@ const maxFuzzyMatchSuggestions = 7
 // Pre-compiled regexes for expression safety validation (performance optimization)
 var (
 	expressionRegex         = regexp.MustCompile(`(?s)\$\{\{(.*?)\}\}`)
-	needsStepsRegex         = regexp.MustCompile(`^(needs|steps)\.[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+)*$`)
 	inputsRegex             = regexp.MustCompile(`^github\.event\.inputs\.[a-zA-Z0-9_-]+$`)
 	workflowCallInputsRegex = regexp.MustCompile(`^inputs\.[a-zA-Z0-9_-]+$`)
 	awInputsRegex           = regexp.MustCompile(`^github\.aw\.inputs\.[a-zA-Z0-9_-]+$`)
@@ -67,7 +66,7 @@ func validateExpressionSafety(markdownContent string) error {
 			// If we can parse it, validate each literal expression in the tree
 			validationErr := VisitExpressionTree(parsed, func(expr *ExpressionNode) error {
 				return validateSingleExpression(expr.Expression, ExpressionValidationOptions{
-					NeedsStepsRe:            needsStepsRegex,
+					NeedsStepsRe:            NeedsStepsPattern,
 					InputsRe:                inputsRegex,
 					WorkflowCallInputsRe:    workflowCallInputsRegex,
 					AwInputsRe:              awInputsRegex,
@@ -82,7 +81,7 @@ func validateExpressionSafety(markdownContent string) error {
 		} else {
 			// If parsing fails, fall back to validating the whole expression as a literal
 			err := validateSingleExpression(expression, ExpressionValidationOptions{
-				NeedsStepsRe:            needsStepsRegex,
+				NeedsStepsRe:            NeedsStepsPattern,
 				InputsRe:                inputsRegex,
 				WorkflowCallInputsRe:    workflowCallInputsRegex,
 				AwInputsRe:              awInputsRegex,

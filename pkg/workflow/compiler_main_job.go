@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -17,20 +16,35 @@ import (
 
 var compilerMainJobLog = logger.New("workflow:compiler_main_job")
 
-// needsJobRefRegex matches `needs.<jobName>.` patterns within arbitrary content.
-// GitHub Actions job names must start with a letter or underscore (A-Za-z_) and
-// may contain alphanumeric characters, hyphens, or underscores (A-Za-z0-9_-).
-var needsJobRefRegex = regexp.MustCompile(`needs\.([A-Za-z_][A-Za-z0-9_-]*)\.`)
-
-// findNeedsJobRefs scans content for `needs.<jobName>.` patterns and returns
-// a sorted, deduplicated list of all job names referenced.
+// findNeedsJobRefs scans content for `needs.<jobName>.` patterns appearing inside
+// GitHub Actions expressions (`${{ ... }}`) and returns a sorted, deduplicated list
+// of all job names referenced.
+//
+// Restricting the scan to expression bodies (rather than the raw input) prevents
+// false-positive matches against:
+//   - Prose/documentation text (e.g. markdown saying "use needs.foo.outputs.x")
+//   - String-literal env values that mention `needs.X.Y` without `${{ }}`
+//   - Code fences in markdown showing example expressions
+//
+// Word-boundary handling in NeedsJobReferencePattern additionally prevents prefix
+// collisions like `myneeds.foo.bar` from matching as `needs.foo.`.
 func findNeedsJobRefs(content string) []string {
-	matches := needsJobRefRegex.FindAllStringSubmatch(content, -1)
-	seen := make(map[string]bool, len(matches))
-	for _, match := range matches {
-		if len(match) >= 2 {
-			seen[match[1]] = true
+	if content == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for _, expr := range ExpressionPatternDotAll.FindAllStringSubmatch(content, -1) {
+		if len(expr) < 2 {
+			continue
 		}
+		for _, match := range NeedsJobReferencePattern.FindAllStringSubmatch(expr[1], -1) {
+			if len(match) >= 2 {
+				seen[match[1]] = struct{}{}
+			}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
 	}
 	result := make([]string, 0, len(seen))
 	for jobName := range seen {

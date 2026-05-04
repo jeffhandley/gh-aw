@@ -13,7 +13,7 @@ func BenchmarkValidateExpression(b *testing.B) {
 
 	for b.Loop() {
 		_ = validateSingleExpression(expression, ExpressionValidationOptions{
-			NeedsStepsRe:            needsStepsRegex,
+			NeedsStepsRe:            NeedsStepsPattern,
 			InputsRe:                inputsRegex,
 			WorkflowCallInputsRe:    workflowCallInputsRegex,
 			AwInputsRe:              awInputsRegex,
@@ -30,7 +30,7 @@ func BenchmarkValidateExpression_Complex(b *testing.B) {
 
 	for b.Loop() {
 		_ = validateSingleExpression(expression, ExpressionValidationOptions{
-			NeedsStepsRe:            needsStepsRegex,
+			NeedsStepsRe:            NeedsStepsPattern,
 			InputsRe:                inputsRegex,
 			WorkflowCallInputsRe:    workflowCallInputsRegex,
 			AwInputsRe:              awInputsRegex,
@@ -47,7 +47,7 @@ func BenchmarkValidateExpression_NeedsOutputs(b *testing.B) {
 
 	for b.Loop() {
 		_ = validateSingleExpression(expression, ExpressionValidationOptions{
-			NeedsStepsRe:            needsStepsRegex,
+			NeedsStepsRe:            NeedsStepsPattern,
 			InputsRe:                inputsRegex,
 			WorkflowCallInputsRe:    workflowCallInputsRegex,
 			AwInputsRe:              awInputsRegex,
@@ -64,7 +64,7 @@ func BenchmarkValidateExpression_StepsOutputs(b *testing.B) {
 
 	for b.Loop() {
 		_ = validateSingleExpression(expression, ExpressionValidationOptions{
-			NeedsStepsRe:            needsStepsRegex,
+			NeedsStepsRe:            NeedsStepsPattern,
 			InputsRe:                inputsRegex,
 			WorkflowCallInputsRe:    workflowCallInputsRegex,
 			AwInputsRe:              awInputsRegex,

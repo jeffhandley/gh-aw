@@ -71,6 +71,42 @@ func TestFindNeedsJobRefs(t *testing.T) {
 			content:  "${{ needs.zebra.outputs.x }} ${{ needs.alpha.outputs.y }}",
 			expected: []string{"alpha", "zebra"},
 		},
+		// --- False-positive prevention cases (word boundary + expression context) ---
+		{
+			name:     "prefix collision NOT matched (word boundary)",
+			content:  "${{ steps.build.outputs.myneeds.foo.bar }}",
+			expected: nil,
+		},
+		{
+			name:     "prose mentioning needs without expression NOT matched",
+			content:  "See needs.legacy_job.outputs.x in the docs (this is plain text, not an expression).",
+			expected: nil,
+		},
+		{
+			name:     "env var literal mentioning needs without expression NOT matched",
+			content:  "DOC: 'use needs.foo.outputs.bar to access the value'",
+			expected: nil,
+		},
+		{
+			name:     "code-fence example in markdown NOT matched (no ${{ }})",
+			content:  "Example syntax:\n```\nneeds.example_job.outputs.value\n```\n",
+			expected: nil,
+		},
+		{
+			name:     "needs reference inside expression IS matched even with prose elsewhere",
+			content:  "Plain text mentioning needs.ignored.outputs.x but ${{ needs.real_job.outputs.value }} is real.",
+			expected: []string{"real_job"},
+		},
+		{
+			name:     "underscore-prefixed identifier NOT confused with needs",
+			content:  "${{ steps.build.outputs.my_needs.foo.bar }}",
+			expected: nil,
+		},
+		{
+			name:     "multiline expression body matched (dotall)",
+			content:  "${{\n  needs.multiline_job.outputs.value\n}}",
+			expected: []string{"multiline_job"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -223,162 +259,203 @@ func TestWarnAboutExcludedBuiltinJobRefs_MultipleContentParts(t *testing.T) {
 // buildMainJob engine.env needs scanning Tests
 // =============================================================================
 
+// engineEnvScanTestEngines lists the AI engine identifiers that the engine.env
+// needs-scanning behavior is expected to be invariant across.  buildMainJob's
+// scanning of `engine.env` and markdown content for `needs.<job>.*` references
+// is engine-agnostic, so each scenario is exercised across every supported
+// engine to guard against future engine-specific regressions.
+//
+// The list mirrors the multi-engine coverage convention established in
+// `engine_config_test.go` (copilot, claude, codex).  These are the three
+// engines that have first-class typed identifiers in `pkg/constants` and
+// represent the broadest range of engine implementations (GitHub Copilot,
+// Anthropic Claude, OpenAI Codex).
+var engineEnvScanTestEngines = []string{
+	string(constants.CopilotEngine),
+	string(constants.ClaudeEngine),
+	string(constants.CodexEngine),
+}
+
 func TestBuildMainJobEngineEnvCustomJobAddsToNeeds(t *testing.T) {
-	compiler := NewCompiler()
-	compiler.stepOrderTracker = NewStepOrderTracker()
+	for _, engine := range engineEnvScanTestEngines {
+		t.Run(engine, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
 
-	workflowData := &WorkflowData{
-		Name:   "Test Workflow",
-		AI:     "copilot",
-		RunsOn: "runs-on: ubuntu-latest",
-		Jobs: map[string]any{
-			"my_fetcher": map[string]any{
-				"runs-on": "ubuntu-latest",
-				"outputs": map[string]any{
-					"value": "${{ steps.fetch.outputs.value }}",
+			workflowData := &WorkflowData{
+				Name:   "Test Workflow",
+				AI:     engine,
+				RunsOn: "runs-on: ubuntu-latest",
+				Jobs: map[string]any{
+					"my_fetcher": map[string]any{
+						"runs-on": "ubuntu-latest",
+						"outputs": map[string]any{
+							"value": "${{ steps.fetch.outputs.value }}",
+						},
+						"steps": []any{
+							map[string]any{"id": "fetch", "run": "echo value=test >> $GITHUB_OUTPUT"},
+						},
+					},
 				},
-				"steps": []any{
-					map[string]any{"id": "fetch", "run": "echo value=test >> $GITHUB_OUTPUT"},
+				EngineConfig: &EngineConfig{
+					Env: map[string]string{
+						"MY_VALUE": "${{ needs.my_fetcher.outputs.value }}",
+					},
 				},
-			},
-		},
-		EngineConfig: &EngineConfig{
-			Env: map[string]string{
-				"MY_VALUE": "${{ needs.my_fetcher.outputs.value }}",
-			},
-		},
+			}
+
+			job, err := compiler.buildMainJob(workflowData, true)
+			require.NoErrorf(t, err, "buildMainJob should succeed for engine %q", engine)
+
+			assert.Truef(t, slices.Contains(job.Needs, "my_fetcher"),
+				"my_fetcher should be in agent needs because it's referenced in engine.env (engine=%q); got: %v", engine, job.Needs)
+		})
 	}
-
-	job, err := compiler.buildMainJob(workflowData, true)
-	require.NoError(t, err, "buildMainJob should succeed")
-
-	assert.Truef(t, slices.Contains(job.Needs, "my_fetcher"),
-		"my_fetcher should be in agent needs because it's referenced in engine.env; got: %v", job.Needs)
 }
 
 func TestBuildMainJobEngineEnvPreActivationExcludedAndWarned(t *testing.T) {
-	compiler := NewCompiler()
-	compiler.stepOrderTracker = NewStepOrderTracker()
-	initialWarnings := compiler.GetWarningCount()
+	for _, engine := range engineEnvScanTestEngines {
+		t.Run(engine, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
+			initialWarnings := compiler.GetWarningCount()
 
-	workflowData := &WorkflowData{
-		Name:   "Test Workflow",
-		AI:     "copilot",
-		RunsOn: "runs-on: ubuntu-latest",
-		EngineConfig: &EngineConfig{
-			Env: map[string]string{
-				// User mistakenly tries to pull pre_activation output into engine.env
-				"MY_PARAM": "${{ needs.pre_activation.outputs.matched_command }}",
-			},
-		},
+			workflowData := &WorkflowData{
+				Name:   "Test Workflow",
+				AI:     engine,
+				RunsOn: "runs-on: ubuntu-latest",
+				EngineConfig: &EngineConfig{
+					Env: map[string]string{
+						// User mistakenly tries to pull pre_activation output into engine.env
+						"MY_PARAM": "${{ needs.pre_activation.outputs.matched_command }}",
+					},
+				},
+			}
+
+			job, err := compiler.buildMainJob(workflowData, true)
+			require.NoErrorf(t, err, "buildMainJob should succeed even when pre_activation is referenced in engine.env (engine=%q)", engine)
+
+			assert.Falsef(t, slices.Contains(job.Needs, string(constants.PreActivationJobName)),
+				"pre_activation must NOT be in agent needs even when referenced in engine.env (engine=%q)", engine)
+
+			assert.Equalf(t, initialWarnings+1, compiler.GetWarningCount(),
+				"A warning should be emitted for the pre_activation reference in engine.env (engine=%q)", engine)
+		})
 	}
-
-	job, err := compiler.buildMainJob(workflowData, true)
-	require.NoError(t, err, "buildMainJob should succeed even when pre_activation is referenced in engine.env")
-
-	assert.False(t, slices.Contains(job.Needs, string(constants.PreActivationJobName)),
-		"pre_activation must NOT be in agent needs even when referenced in engine.env")
-
-	assert.Equal(t, initialWarnings+1, compiler.GetWarningCount(),
-		"A warning should be emitted for the pre_activation reference in engine.env")
 }
 
 func TestBuildMainJobMarkdownPreActivationRefWarned(t *testing.T) {
-	compiler := NewCompiler()
-	compiler.stepOrderTracker = NewStepOrderTracker()
-	initialWarnings := compiler.GetWarningCount()
+	for _, engine := range engineEnvScanTestEngines {
+		t.Run(engine, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
+			initialWarnings := compiler.GetWarningCount()
 
-	workflowData := &WorkflowData{
-		Name:            "Test Workflow",
-		AI:              "copilot",
-		RunsOn:          "runs-on: ubuntu-latest",
-		MarkdownContent: "Use value ${{ needs.pre_activation.outputs.matched_command }} here.",
+			workflowData := &WorkflowData{
+				Name:            "Test Workflow",
+				AI:              engine,
+				RunsOn:          "runs-on: ubuntu-latest",
+				MarkdownContent: "Use value ${{ needs.pre_activation.outputs.matched_command }} here.",
+			}
+
+			job, err := compiler.buildMainJob(workflowData, true)
+			require.NoErrorf(t, err, "buildMainJob should succeed even when pre_activation is referenced in markdown (engine=%q)", engine)
+
+			assert.Falsef(t, slices.Contains(job.Needs, string(constants.PreActivationJobName)),
+				"pre_activation must NOT be in agent needs when referenced in markdown (engine=%q)", engine)
+
+			assert.Equalf(t, initialWarnings+1, compiler.GetWarningCount(),
+				"A warning should be emitted for the pre_activation reference in markdown (engine=%q)", engine)
+		})
 	}
-
-	job, err := compiler.buildMainJob(workflowData, true)
-	require.NoError(t, err, "buildMainJob should succeed even when pre_activation is referenced in markdown")
-
-	assert.False(t, slices.Contains(job.Needs, string(constants.PreActivationJobName)),
-		"pre_activation must NOT be in agent needs when referenced in markdown")
-
-	assert.Equal(t, initialWarnings+1, compiler.GetWarningCount(),
-		"A warning should be emitted for the pre_activation reference in markdown")
 }
 
 func TestBuildMainJobEngineEnvNilConfigNoWarnings(t *testing.T) {
-	compiler := NewCompiler()
-	compiler.stepOrderTracker = NewStepOrderTracker()
-	initialWarnings := compiler.GetWarningCount()
+	for _, engine := range engineEnvScanTestEngines {
+		t.Run(engine, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
+			initialWarnings := compiler.GetWarningCount()
 
-	workflowData := &WorkflowData{
-		Name:         "Test Workflow",
-		AI:           "copilot",
-		RunsOn:       "runs-on: ubuntu-latest",
-		EngineConfig: nil,
+			workflowData := &WorkflowData{
+				Name:         "Test Workflow",
+				AI:           engine,
+				RunsOn:       "runs-on: ubuntu-latest",
+				EngineConfig: nil,
+			}
+
+			_, err := compiler.buildMainJob(workflowData, true)
+			require.NoErrorf(t, err, "buildMainJob should succeed when EngineConfig is nil (engine=%q)", engine)
+
+			assert.Equalf(t, initialWarnings, compiler.GetWarningCount(),
+				"No warnings should be emitted when EngineConfig is nil (engine=%q)", engine)
+		})
 	}
-
-	_, err := compiler.buildMainJob(workflowData, true)
-	require.NoError(t, err, "buildMainJob should succeed when EngineConfig is nil")
-
-	assert.Equal(t, initialWarnings, compiler.GetWarningCount(),
-		"No warnings should be emitted when EngineConfig is nil")
 }
 
 func TestBuildMainJobEngineEnvActivationRefNoWarning(t *testing.T) {
 	// activation IS already in the agent needs list — referencing its outputs in engine.env should not warn
-	compiler := NewCompiler()
-	compiler.stepOrderTracker = NewStepOrderTracker()
-	initialWarnings := compiler.GetWarningCount()
+	for _, engine := range engineEnvScanTestEngines {
+		t.Run(engine, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
+			initialWarnings := compiler.GetWarningCount()
 
-	workflowData := &WorkflowData{
-		Name:   "Test Workflow",
-		AI:     "copilot",
-		RunsOn: "runs-on: ubuntu-latest",
-		EngineConfig: &EngineConfig{
-			Env: map[string]string{
-				"MODEL": "${{ needs.activation.outputs.model }}",
-			},
-		},
+			workflowData := &WorkflowData{
+				Name:   "Test Workflow",
+				AI:     engine,
+				RunsOn: "runs-on: ubuntu-latest",
+				EngineConfig: &EngineConfig{
+					Env: map[string]string{
+						"MODEL": "${{ needs.activation.outputs.model }}",
+					},
+				},
+			}
+
+			_, err := compiler.buildMainJob(workflowData, true)
+			require.NoErrorf(t, err, "buildMainJob should succeed (engine=%q)", engine)
+
+			assert.Equalf(t, initialWarnings, compiler.GetWarningCount(),
+				"No warning should be emitted for activation outputs — activation is in the agent needs list (engine=%q)", engine)
+		})
 	}
-
-	_, err := compiler.buildMainJob(workflowData, true)
-	require.NoError(t, err, "buildMainJob should succeed")
-
-	assert.Equal(t, initialWarnings, compiler.GetWarningCount(),
-		"No warning should be emitted for activation outputs — activation is in the agent needs list")
 }
 
 func TestBuildMainJobEngineEnvCustomJobNotDuplicatedInNeeds(t *testing.T) {
 	// A custom job referenced both in the markdown body and in engine.env should appear only once in needs
-	compiler := NewCompiler()
-	compiler.stepOrderTracker = NewStepOrderTracker()
+	for _, engine := range engineEnvScanTestEngines {
+		t.Run(engine, func(t *testing.T) {
+			compiler := NewCompiler()
+			compiler.stepOrderTracker = NewStepOrderTracker()
 
-	workflowData := &WorkflowData{
-		Name:            "Test Workflow",
-		AI:              "copilot",
-		RunsOn:          "runs-on: ubuntu-latest",
-		MarkdownContent: "Result: ${{ needs.my_fetcher.outputs.value }}",
-		Jobs: map[string]any{
-			"my_fetcher": map[string]any{
-				"runs-on": "ubuntu-latest",
-			},
-		},
-		EngineConfig: &EngineConfig{
-			Env: map[string]string{
-				"MY_VALUE": "${{ needs.my_fetcher.outputs.value }}",
-			},
-		},
+			workflowData := &WorkflowData{
+				Name:            "Test Workflow",
+				AI:              engine,
+				RunsOn:          "runs-on: ubuntu-latest",
+				MarkdownContent: "Result: ${{ needs.my_fetcher.outputs.value }}",
+				Jobs: map[string]any{
+					"my_fetcher": map[string]any{
+						"runs-on": "ubuntu-latest",
+					},
+				},
+				EngineConfig: &EngineConfig{
+					Env: map[string]string{
+						"MY_VALUE": "${{ needs.my_fetcher.outputs.value }}",
+					},
+				},
+			}
+
+			job, err := compiler.buildMainJob(workflowData, true)
+			require.NoErrorf(t, err, "buildMainJob should succeed (engine=%q)", engine)
+
+			count := 0
+			for _, need := range job.Needs {
+				if need == "my_fetcher" {
+					count++
+				}
+			}
+			assert.Equalf(t, 1, count,
+				"my_fetcher should appear exactly once in agent needs even when referenced in both markdown and engine.env (engine=%q); got needs: %v", engine, job.Needs)
+		})
 	}
-
-	job, err := compiler.buildMainJob(workflowData, true)
-	require.NoError(t, err, "buildMainJob should succeed")
-
-	count := 0
-	for _, need := range job.Needs {
-		if need == "my_fetcher" {
-			count++
-		}
-	}
-	assert.Equalf(t, 1, count,
-		"my_fetcher should appear exactly once in agent needs even when referenced in both markdown and engine.env; got needs: %v", job.Needs)
 }
