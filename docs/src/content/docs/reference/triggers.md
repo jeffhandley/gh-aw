@@ -713,6 +713,29 @@ if: needs.pre_activation.outputs.has_bug_label == 'true'
 
 Explicit outputs defined in `jobs.pre-activation.outputs` take precedence over auto-wired `<id>_result` outputs on key collision.
 
+:::note[pre_activation outputs are not available in engine.env]
+`pre_activation` is intentionally excluded from the agent job's `needs` list for security reasons, so `${{ needs.pre_activation.outputs.* }}` expressions in `engine.env` values will **not** work. The compiler emits a warning when references to excluded, built-in jobs are detected.
+
+To drive an `engine.env` value from a `pre_activation` output, create an intermediate custom job that depends on `pre_activation` and exposes the value, then reference that custom job's output in `engine.env`:
+
+```yaml wrap
+jobs:
+  expose_outputs_to_agent:
+    needs: [pre_activation]
+    runs-on: ubuntu-latest
+    outputs:
+      my_param: ${{ needs.pre_activation.outputs.my_custom_output }}
+    steps:
+      - run: echo "Exposing 'my_custom_output' to agent job"
+
+engine:
+  env:
+    MY_PARAM: ${{ needs.expose_outputs_to_agent.outputs.my_param }}
+```
+
+The compiler automatically adds `expose_outputs_to_agent` to the agent job's `needs` list when it detects the reference in `engine.env` (the same automatic needs detection applies when the job is referenced in the workflow's markdown body or custom steps).
+:::
+
 ### Pre-Activation and Activation Dependencies (`on.needs:`)
 
 Add custom jobs that both `pre_activation` and `activation` should depend on. Use this when `on.github-app` credentials come from a job output (for example, a secret-manager fetch job).

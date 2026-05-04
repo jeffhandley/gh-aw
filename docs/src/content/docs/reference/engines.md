@@ -128,6 +128,31 @@ engine:
     CUSTOM_API_ENDPOINT: https://api.example.com
 ```
 
+`engine.env` values may include GitHub Actions expressions such as `${{ needs.my_job.outputs.value }}`. When the compiler detects a `needs.<job>.outputs.*` reference in an `engine.env` value, the workflow's markdown body, or custom steps, it automatically adds that job to the agent job's `needs` list so the output is available at runtime.
+
+:::note[pre_activation outputs are not available in engine.env]
+`pre_activation` is intentionally excluded from the agent job's `needs` list for security reasons, so `${{ needs.pre_activation.outputs.* }}` expressions in `engine.env` values will **not** work. The compiler emits a warning when references to excluded, built-in jobs are detected.
+
+To drive an `engine.env` value from a `pre_activation` output, create an intermediate custom job that depends on `pre_activation` and exposes the value, then reference that custom job's output in `engine.env`:
+
+```yaml wrap
+jobs:
+  expose_outputs_to_agent:
+    needs: [pre_activation]
+    runs-on: ubuntu-latest
+    outputs:
+      my_param: ${{ needs.pre_activation.outputs.my_custom_output }}
+    steps:
+      - run: echo "Exposing 'my_custom_output' to agent job"
+
+engine:
+  env:
+    MY_PARAM: ${{ needs.expose_outputs_to_agent.outputs.my_param }}
+```
+
+The compiler automatically adds `expose_outputs_to_agent` to the agent job's `needs` list when it detects the reference in `engine.env` (the same automatic needs detection applies when the job is referenced in the workflow's markdown body or custom steps).
+:::
+
 Environment variables can also be defined at workflow, job, step, and other scopes. See [Environment Variables](/gh-aw/reference/environment-variables/) for complete documentation on precedence and all 13 env scopes.
 
 ### Enterprise API Endpoint (`api-target`)

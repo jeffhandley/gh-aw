@@ -3,15 +3,125 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"os"
+	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
 var compilerMainJobLog = logger.New("workflow:compiler_main_job")
+
+// needsJobRefRegex matches `needs.<jobName>.` patterns within arbitrary content.
+// GitHub Actions job names must start with a letter or underscore (A-Za-z_) and
+// may contain alphanumeric characters, hyphens, or underscores (A-Za-z0-9_-).
+var needsJobRefRegex = regexp.MustCompile(`needs\.([A-Za-z_][A-Za-z0-9_-]*)\.`)
+
+// findNeedsJobRefs scans content for `needs.<jobName>.` patterns and returns
+// a sorted, deduplicated list of all job names referenced.
+func findNeedsJobRefs(content string) []string {
+	matches := needsJobRefRegex.FindAllStringSubmatch(content, -1)
+	seen := make(map[string]bool, len(matches))
+	for _, match := range matches {
+		if len(match) >= 2 {
+			seen[match[1]] = true
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for jobName := range seen {
+		result = append(result, jobName)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// buildEngineEnvContent concatenates all engine.env values into a single string
+// suitable for needs expression scanning.  Returns an empty string when there is
+// no engine configuration or no env entries.
+func buildEngineEnvContent(data *WorkflowData) string {
+	if data.EngineConfig == nil || len(data.EngineConfig.Env) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, value := range data.EngineConfig.Env {
+		b.WriteString(value)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// warnAboutExcludedBuiltinJobRefs emits a compile warning for each built-in job that is
+// referenced via a needs.JOB.* expression in any of the provided content strings but will
+// not appear in the agent job's needs list (i.e. it is excluded).
+//
+// Excluded built-in jobs whose outputs are referenced in the agent job context (markdown
+// body, custom steps, engine.env) cannot provide values at agent runtime:
+//   - pre_activation is intentionally excluded from the agent needs list for security
+//     reasons — membership/permission checks run there and must not become a direct
+//     dependency of the agent.  Use an intermediate custom job to relay any output.
+//   - Other built-in jobs (detection, safe_outputs, conclusion, …) run after the agent
+//     job and therefore cannot be in the agent's needs list.
+//
+// The agentNeeds slice lists the job names that ARE already in the agent's needs list
+// (e.g. ["activation"]) so they are not warned about.
+func (c *Compiler) warnAboutExcludedBuiltinJobRefs(agentNeeds []string, contentParts ...string) {
+	// Build a fast lookup set for jobs already present in the agent's needs.
+	needsSet := make(map[string]bool, len(agentNeeds))
+	for _, n := range agentNeeds {
+		needsSet[n] = true
+	}
+
+	// Collect unique excluded built-in jobs referenced across all content parts.
+	seen := make(map[string]bool)
+	for _, content := range contentParts {
+		if content == "" {
+			continue
+		}
+		for _, jobName := range findNeedsJobRefs(content) {
+			if isBuiltinJobName(jobName) && !needsSet[jobName] && !seen[jobName] {
+				seen[jobName] = true
+			}
+		}
+	}
+
+	if len(seen) == 0 {
+		return
+	}
+
+	// Emit one warning per excluded built-in job, sorted for deterministic output.
+	excluded := make([]string, 0, len(seen))
+	for jobName := range seen {
+		excluded = append(excluded, jobName)
+	}
+	sort.Strings(excluded)
+
+	for _, jobName := range excluded {
+		var warningMsg string
+		if jobName == string(constants.PreActivationJobName) || jobName == string(constants.PreActivationHyphenJobName) {
+			warningMsg = fmt.Sprintf(
+				"needs.%s.outputs.* referenced but pre_activation outputs are not available to the agent job. "+
+					"pre_activation is intentionally excluded from the agent needs list for security reasons. "+
+					"Use an intermediate custom job that explicitly depends on pre_activation to relay the output to the agent. "+
+					"See https://github.com/github/gh-aw/issues/18017 for guidance.",
+				jobName,
+			)
+		} else {
+			warningMsg = fmt.Sprintf(
+				"needs.%s.outputs.* referenced but outputs from the %q built-in job cannot be referenced in the agent job: "+
+					"%q is not in the agent job's needs list.",
+				jobName, jobName, jobName,
+			)
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
+		c.IncrementWarningCount()
+		compilerMainJobLog.Printf("Warned about excluded built-in job reference: %s", jobName)
+	}
+}
 
 func isBuiltinJobName(jobName string) bool {
 	_, isBuiltIn := constants.KnownBuiltInJobNames[jobName]
@@ -124,7 +234,8 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		contentBuilder.WriteByte('\n')
 		contentBuilder.WriteString(data.CustomSteps)
 	}
-	referencedJobs := c.getReferencedCustomJobs(contentBuilder.String(), data.Jobs)
+	content := contentBuilder.String()
+	referencedJobs := c.getReferencedCustomJobs(content, data.Jobs)
 	for _, jobName := range referencedJobs {
 		// Skip built-in jobs as they are handled separately and should not become custom dependencies.
 		if isBuiltinJobName(jobName) {
@@ -139,6 +250,35 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 			compilerMainJobLog.Printf("Added direct dependency on custom job '%s' because it's referenced in workflow content", jobName)
 		}
 	}
+
+	// Scan engine.env values for needs.JOB.* expressions and add referenced custom jobs as
+	// direct dependencies of the agent job.  This mirrors the markdown/custom-steps scanning
+	// above: engine.env values may contain expressions like
+	//   MY_VAR: ${{ needs.my_fetcher_job.outputs.value }}
+	// that require the referenced job to be in the agent's needs list.
+	//
+	// pre_activation is intentionally excluded here — it must not become a direct agent
+	// dependency for security reasons (see warnAboutExcludedBuiltinJobRefs below).
+	engineEnvContent := buildEngineEnvContent(data)
+	if engineEnvContent != "" {
+		engineEnvReferencedJobs := c.getReferencedCustomJobs(engineEnvContent, data.Jobs)
+		for _, jobName := range engineEnvReferencedJobs {
+			// Built-in jobs are excluded; custom jobs in data.Jobs are handled here.
+			if isBuiltinJobName(jobName) {
+				continue
+			}
+			if !slices.Contains(depends, jobName) {
+				depends = append(depends, jobName)
+				compilerMainJobLog.Printf("Added direct dependency on custom job '%s' because it's referenced in engine.env", jobName)
+			}
+		}
+	}
+
+	// Warn when any built-in job that will be EXCLUDED from the agent needs list is referenced
+	// in a needs expression anywhere we scan (markdown body, custom steps, engine.env).
+	// This catches the common mistake of writing needs.pre_activation.outputs.* in engine.env,
+	// where pre_activation is never a direct needs of the agent job.
+	c.warnAboutExcludedBuiltinJobRefs(depends, content, engineEnvContent)
 
 	// Build outputs for all engines (GH_AW_SAFE_OUTPUTS functionality)
 	// Build job outputs
