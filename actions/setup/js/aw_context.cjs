@@ -144,7 +144,9 @@ function parseInboundAwContext(raw) {
     return null;
   }
   if (typeof raw === "object" && !Array.isArray(raw)) {
-    return /** @type {Record<string, unknown>} */ raw;
+    /** @type {any} */
+    const result = raw;
+    return result;
   }
   return null;
 }
