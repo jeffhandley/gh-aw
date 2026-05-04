@@ -133,6 +133,8 @@ func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *Workflow
 // envOverrides: optional map of env var key to expression override (from engine.env); when set,
 // the overridden expression is used instead of the default "${{ secrets.KEY }}" so the
 // validation step checks the user-provided secret reference rather than the default one.
+// Multi-line values (e.g. from a folded YAML block scalar in engine.env) are emitted as
+// YAML literal block scalars to produce valid compiled output.
 func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string, envOverrides map[string]string) GitHubActionStep {
 	if len(secretNames) == 0 {
 		// This is a programming error - engine configurations should always provide secrets
@@ -167,7 +169,7 @@ func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL
 				expr = override
 			}
 		}
-		stepLines = append(stepLines, fmt.Sprintf("          %s: %s", secretName, expr))
+		stepLines = appendEnvVarLine(stepLines, secretName, expr)
 	}
 
 	return GitHubActionStep(stepLines)
@@ -263,14 +265,48 @@ func FormatStepWithCommandAndEnv(stepLines []string, command string, env map[str
 
 		for _, key := range envKeys {
 			value := env[key]
-			stepLines = append(stepLines, fmt.Sprintf("          %s: %s", key, yamlStringValue(value)))
+			stepLines = appendEnvVarLine(stepLines, key, value)
 		}
 	}
 
 	return stepLines
 }
 
-// yamlStringValue returns a YAML-safe representation of a string value.
+// appendEnvVarLine appends a YAML env var key-value pair to stepLines using 10-space
+// key indentation (the standard for env sections within GitHub Actions steps in compiled
+// workflows). If the value contains embedded newlines — for example when the user writes
+// the value as a multi-line YAML block scalar (e.g. ">-") in the workflow frontmatter —
+// the value is emitted as a YAML literal block scalar with 12-space content indentation
+// so the compiled output is valid YAML. Trailing newlines are stripped before checking
+// for embedded newlines; they arise naturally from YAML "|" block scalars and should not
+// cause unnecessary block-scalar emission. Both Unix ("\n") and Windows ("\r\n") line
+// endings are handled defensively so trailing carriage returns do not leak into the
+// compiled YAML.
+func appendEnvVarLine(stepLines []string, key, value string) []string {
+	// Trim trailing newlines (Unix \n and Windows \r\n) that YAML block scalars (e.g. "|")
+	// append to the parsed value.
+	trimmed := strings.TrimRight(value, "\r\n")
+	if strings.Contains(trimmed, "\n") {
+		// Multi-line value (e.g. a ">-" folded block scalar with extra-indented continuation
+		// lines): emit as a YAML literal block scalar so the compiled output is valid YAML.
+		stepLines = append(stepLines, fmt.Sprintf("          %s: |", key))
+		for line := range strings.SplitSeq(trimmed, "\n") {
+			// Strip any trailing "\r" left behind from Windows ("\r\n") line endings so
+			// the emitted YAML does not contain literal carriage returns.
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				stepLines = append(stepLines, "")
+			} else {
+				stepLines = append(stepLines, "            "+line)
+			}
+		}
+	} else {
+		stepLines = append(stepLines, fmt.Sprintf("          %s: %s", key, yamlStringValue(trimmed)))
+	}
+	return stepLines
+}
+
+// yamlStringValue returns a YAML-safe representation of a single-line string value.
 // If the value starts with a YAML flow indicator ('{' or '[') or other characters
 // that would cause it to be misinterpreted by YAML parsers, it wraps the value
 // in single quotes. Any embedded single quotes are escaped by doubling them (' becomes ”).

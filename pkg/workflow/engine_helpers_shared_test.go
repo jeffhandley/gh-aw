@@ -232,6 +232,53 @@ func TestFormatStepWithCommandAndEnv(t *testing.T) {
 				"          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
 			},
 		},
+		{
+			// When engine.env specifies a token using a multi-line YAML block scalar
+			// (e.g. ">-" with extra-indented continuation lines), the parsed value contains
+			// embedded newlines. The compiled output must emit it as a YAML literal block
+			// scalar instead of placing the multi-line value on a single line (which would
+			// produce invalid YAML).
+			name:      "Multi-line env var value uses YAML literal block scalar",
+			stepLines: []string{"      - name: PAT Selection Step"},
+			command:   "echo selecting PAT",
+			env: map[string]string{
+				// Simulates a ">-" folded block scalar with extra-indented continuation lines.
+				// goccy/go-yaml treats lines indented more than the first content line as
+				// "more-indented" lines whose preceding newline is NOT folded to a space, so
+				// the parsed value contains literal \n characters.
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||\n" +
+					"        secrets.GH_AW_PAT_2 != '' && secrets.GH_AW_PAT_2 ||\n" +
+					"        secrets.GH_AW_PAT_3 != '' && secrets.GH_AW_PAT_3 ||\n" +
+					"        secrets.GH_AW_PAT_4 != '' && secrets.GH_AW_PAT_4 ||\n" +
+					"        secrets.GH_AW_PAT_5 }}",
+			},
+			expectedContent: []string{
+				// Value must be emitted as a YAML literal block scalar.
+				"          COPILOT_GITHUB_TOKEN: |",
+				"            ${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||",
+				"            secrets.GH_AW_PAT_5 }}",
+			},
+			notExpected: []string{
+				// The broken single-line form that produces invalid YAML must NOT appear.
+				"COPILOT_GITHUB_TOKEN: ${{ secrets.GH_AW_PAT_1",
+			},
+		},
+		{
+			// Trailing newlines (added by YAML "|" block scalars) must be stripped so a
+			// single-line value is not unnecessarily emitted as a block scalar.
+			name:      "Trailing newline in env var value is stripped",
+			stepLines: []string{"      - name: Token Step"},
+			command:   "echo using token",
+			env: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.COPILOT_GITHUB_TOKEN }}\n",
+			},
+			expectedContent: []string{
+				"          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}",
+			},
+			notExpected: []string{
+				"COPILOT_GITHUB_TOKEN: |",
+			},
+		},
 	}
 
 	for _, tt := range tests {

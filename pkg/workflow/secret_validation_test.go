@@ -250,6 +250,45 @@ func TestGenerateMultiSecretValidationStepWithEnvOverrides(t *testing.T) {
 			t.Errorf("Expected default OPENAI_API_KEY expression (not overridden), got:\n%s", stepContent)
 		}
 	})
+
+	// A multi-line engine.env override (e.g. PAT selection expressed as a case-like
+	// precedence chain across multiple lines using ">-" in the workflow frontmatter)
+	// must be emitted as a YAML literal block scalar in the compiled output.
+	t.Run("multi-line override emits YAML literal block scalar", func(t *testing.T) {
+		// This simulates what goccy/go-yaml produces when parsing a ">-" folded block scalar
+		// whose continuation lines are more-indented than the first content line — the
+		// newlines before those lines are NOT folded to spaces.
+		multiLineExpr := "${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||\n" +
+			"        secrets.GH_AW_PAT_2 != '' && secrets.GH_AW_PAT_2 ||\n" +
+			"        secrets.GH_AW_PAT_3 != '' && secrets.GH_AW_PAT_3 ||\n" +
+			"        secrets.GH_AW_PAT_4 != '' && secrets.GH_AW_PAT_4 ||\n" +
+			"        secrets.GH_AW_PAT_5 }}"
+		overrides := map[string]string{
+			"COPILOT_GITHUB_TOKEN": multiLineExpr,
+		}
+		step := GenerateMultiSecretValidationStep(
+			[]string{"COPILOT_GITHUB_TOKEN"},
+			"GitHub Copilot CLI",
+			"https://docs.example.com",
+			overrides,
+		)
+		stepContent := strings.Join(step, "\n")
+
+		// The env var must use a YAML literal block scalar indicator.
+		if !strings.Contains(stepContent, "          COPILOT_GITHUB_TOKEN: |") {
+			t.Errorf("Expected YAML literal block scalar for multi-line override, got:\n%s", stepContent)
+		}
+		// Every line of the PAT chain must appear as an indented block scalar content line.
+		for _, pat := range []string{"GH_AW_PAT_1", "GH_AW_PAT_2", "GH_AW_PAT_3", "GH_AW_PAT_4", "GH_AW_PAT_5"} {
+			if !strings.Contains(stepContent, pat) {
+				t.Errorf("Expected PAT %s to appear in compiled output, got:\n%s", pat, stepContent)
+			}
+		}
+		// A raw multi-line value on a single YAML line must NOT appear (that would be invalid YAML).
+		if strings.Contains(stepContent, "COPILOT_GITHUB_TOKEN: ${{ secrets.GH_AW_PAT_1") {
+			t.Errorf("Multi-line value must not be placed on a single YAML line, got:\n%s", stepContent)
+		}
+	})
 }
 
 func TestValidationStepUsesEngineEnvOverride(t *testing.T) {

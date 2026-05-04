@@ -340,3 +340,127 @@ func TestFormatStepWithCommandAndEnvYAMLSafe(t *testing.T) {
 		}
 	})
 }
+
+// TestAppendEnvVarLine verifies that appendEnvVarLine produces valid YAML for both
+// single-line and multi-line values. This tests multi-line engine.env values.
+func TestAppendEnvVarLine(t *testing.T) {
+	tests := []struct {
+		name            string
+		key             string
+		value           string
+		expectedLines   []string
+		unexpectedLines []string
+	}{
+		{
+			name:  "single-line value uses inline scalar",
+			key:   "COPILOT_GITHUB_TOKEN",
+			value: "${{ secrets.COPILOT_GITHUB_TOKEN }}",
+			expectedLines: []string{
+				"          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}",
+			},
+			unexpectedLines: []string{"COPILOT_GITHUB_TOKEN: |"},
+		},
+		{
+			// A ">-" folded block scalar with extra-indented continuation lines produces a
+			// parsed string with embedded newlines. The output must use a YAML literal
+			// block scalar so the compiled workflow is valid YAML.
+			name: "five-PAT precedence chain emits YAML literal block scalar",
+			key:  "COPILOT_GITHUB_TOKEN",
+			value: "${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||\n" +
+				"        secrets.GH_AW_PAT_2 != '' && secrets.GH_AW_PAT_2 ||\n" +
+				"        secrets.GH_AW_PAT_3 != '' && secrets.GH_AW_PAT_3 ||\n" +
+				"        secrets.GH_AW_PAT_4 != '' && secrets.GH_AW_PAT_4 ||\n" +
+				"        secrets.GH_AW_PAT_5 }}",
+			expectedLines: []string{
+				"          COPILOT_GITHUB_TOKEN: |",
+				"            ${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||",
+				"            secrets.GH_AW_PAT_5 }}",
+			},
+			unexpectedLines: []string{
+				// The broken single-line form must NOT appear.
+				"COPILOT_GITHUB_TOKEN: ${{ secrets.GH_AW_PAT_1",
+			},
+		},
+		{
+			// A YAML "|" block scalar appends a trailing newline to the parsed string.
+			// The trailing newline must be stripped so a single-line value is not
+			// unnecessarily emitted as a block scalar.
+			name:  "trailing newline is stripped before emitting",
+			key:   "MY_TOKEN",
+			value: "${{ secrets.MY_TOKEN }}\n",
+			expectedLines: []string{
+				"          MY_TOKEN: ${{ secrets.MY_TOKEN }}",
+			},
+			unexpectedLines: []string{"MY_TOKEN: |"},
+		},
+		{
+			// JSON values starting with "{" or "[" are still single-quoted (existing behaviour).
+			name:  "json object is single-quoted",
+			key:   "MY_JSON",
+			value: `{"key":"value"}`,
+			expectedLines: []string{
+				`          MY_JSON: '{"key":"value"}'`,
+			},
+			unexpectedLines: []string{"MY_JSON: |"},
+		},
+		{
+			// Empty values are emitted as "KEY: " (parsed as null by YAML, equivalent to
+			// an empty env value for GitHub Actions). Documents existing behaviour so a
+			// future change to quote empty values would surface as a test update.
+			name:  "empty value emits bare key",
+			key:   "EMPTY",
+			value: "",
+			expectedLines: []string{
+				"          EMPTY: ",
+			},
+			unexpectedLines: []string{"EMPTY: |"},
+		},
+		{
+			// Windows ("\r\n") line endings must not leak literal carriage returns into the
+			// compiled YAML. Both the trailing CRLF and per-line CRs must be stripped.
+			name: "windows CRLF line endings are normalized",
+			value: "${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||\r\n" +
+				"        secrets.GH_AW_PAT_2 }}\r\n",
+			key: "MY_TOKEN",
+			expectedLines: []string{
+				"          MY_TOKEN: |",
+				"            ${{ secrets.GH_AW_PAT_1 != '' && secrets.GH_AW_PAT_1 ||",
+				"            secrets.GH_AW_PAT_2 }}",
+			},
+			unexpectedLines: []string{
+				// No literal carriage returns should remain anywhere in the output.
+				"\r",
+			},
+		},
+		{
+			// Single-line values containing ":" (such as URLs) are emitted unquoted; the
+			// colon is not a YAML mapping indicator unless followed by whitespace or end of
+			// line, so "http://example.com" is a valid plain scalar.
+			name:  "single-line value containing colon is emitted unquoted",
+			key:   "URL",
+			value: "http://example.com",
+			expectedLines: []string{
+				"          URL: http://example.com",
+			},
+			unexpectedLines: []string{"URL: |"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := appendEnvVarLine([]string{}, tt.key, tt.value)
+			resultStr := strings.Join(result, "\n")
+
+			for _, expected := range tt.expectedLines {
+				if !strings.Contains(resultStr, expected) {
+					t.Errorf("Expected result to contain %q\nGot:\n%s", expected, resultStr)
+				}
+			}
+			for _, unexpected := range tt.unexpectedLines {
+				if strings.Contains(resultStr, unexpected) {
+					t.Errorf("Expected result NOT to contain %q\nGot:\n%s", unexpected, resultStr)
+				}
+			}
+		})
+	}
+}
